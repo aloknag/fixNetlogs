@@ -41,15 +41,19 @@ def complete_incomplete_event(event_text):
     missing_braces = open_braces - close_braces
     
     # If the event text is not empty and has unmatched braces
-    if event_text and missing_braces > 0:
+    if event_text and (missing_braces > 0 or event_text.count('"') % 2 == 1):
         # Check if we have an unterminated string
         quote_count = event_text.count('"')
         if quote_count % 2 == 1:  # Unterminated string
             event_text += '"'
         
         # Add missing closing braces
-        event_text += '}' * missing_braces
+        if missing_braces > 0:
+            event_text += '}' * missing_braces
         
+        # Fix key with no value, e.g. "foo": } -> "foo": null }
+        event_text = re.sub(r'":\s*([,}])', r'": null\1', event_text)
+
         try:
             # Try to parse the completed event
             event = json.loads(event_text)
@@ -106,110 +110,53 @@ def extract_json_section(text, key):
     return completed_section, (match.start(), len(completed_section))
 
 
-def parse_events_array_aggressive(events_text):
+def parse_events_array_robust(events_text):
     """
-    Aggressively parse and complete the events array, trying to salvage as much as possible.
+    Robustly parse the events array using raw_decode, and try to complete the final event if truncated.
     """
     events = []
-    
-    # Clean up the events text
+    decoder = json.JSONDecoder()
+
+    # Clean up the events text by removing the outer brackets
     if events_text.startswith('['):
         events_text = events_text[1:]
     if events_text.endswith(']'):
         events_text = events_text[:-1]
     
-    # First, try to fix obvious issues like unterminated strings
-    events_text = fix_common_json_issues(events_text)
+    events_text = events_text.strip()
     
-    # Split on complete event boundaries (},) but preserve incomplete events
-    potential_events = split_on_event_boundaries(events_text)
-    
-    for i, event_text in enumerate(potential_events):
-        event_text = event_text.strip()
-        if not event_text:
-            continue
-            
-        # Try to parse the event as-is first
+    pos = 0
+    while pos < len(events_text):
+        # Skip over leading commas and whitespace from the previous iteration
+        new_pos = pos
+        for i in range(pos, len(events_text)):
+            if events_text[i] in ' \t\n\r,':
+                new_pos += 1
+            else:
+                break
+        pos = new_pos
+        if pos >= len(events_text):
+            break
+
         try:
-            event = json.loads(event_text)
-            events.append(event)
-            continue
+            # Use raw_decode to parse one object from the current position
+            obj, pos = decoder.raw_decode(events_text, pos)
+            events.append(obj)
         except json.JSONDecodeError:
-            pass
-        
-        # Try to complete the incomplete event
-        completed_event = complete_incomplete_event(event_text)
-        if completed_event:
-            events.append(completed_event)
-            print(f"⚠️  Completed and recovered event {i+1}")
-        else:
-            print(f"⚠️  Could not recover event {i+1}: {event_text[:100]}...")
-    
-    return events
-
-
-def fix_common_json_issues(text):
-    """
-    Fix common JSON issues like unterminated strings, trailing commas, etc.
-    """
-    # Handle unterminated strings at the end
-    quote_count = text.count('"')
-    if quote_count % 2 == 1:
-        # Find the last quote
-        last_quote = text.rfind('"')
-        if last_quote > 0:
-            # Check if it's escaped
-            if last_quote > 0 and text[last_quote - 1] != '\\':
-                text += '"'
-                print("⚠️  Fixed unterminated string")
-    
-    # Remove trailing commas before closing brackets/braces
-    text = re.sub(r',(\s*[\]}])', r'\1', text)
-    
-    return text
-
-
-def split_on_event_boundaries(text):
-    """
-    Split text on event boundaries, keeping incomplete events.
-    """
-    events = []
-    current_event = ""
-    brace_depth = 0
-    in_string = False
-    escape_next = False
-    
-    for char in text:
-        if escape_next:
-            escape_next = False
-            current_event += char
-            continue
+            # The rest of the string is the broken part
+            broken_part = events_text[pos:]
+            print(f"⚠️  Incomplete event found. Attempting to recover...")
             
-        if char == '\\' and in_string:
-            escape_next = True
-            current_event += char
-            continue
+            completed_event = complete_incomplete_event(broken_part)
+            if completed_event:
+                events.append(completed_event)
+                print(f"✅  Successfully recovered and completed the final event.")
+            else:
+                print(f"❌  Could not recover the final event. Discarding.")
             
-        if char == '"' and not escape_next:
-            in_string = not in_string
+            # Stop processing after the first error, as we've handled the remainder
+            break
             
-        current_event += char
-        
-        if not in_string:
-            if char == '{':
-                brace_depth += 1
-            elif char == '}':
-                brace_depth -= 1
-                
-                # Complete event found
-                if brace_depth == 0:
-                    events.append(current_event.rstrip(',').strip())
-                    current_event = ""
-    
-    # Add any remaining incomplete event
-    if current_event.strip():
-        events.append(current_event.strip())
-    
     return events
 
 
@@ -247,7 +194,7 @@ def fix_netlog(input_path, output_path):
             print("⚠️ 'constants' block is malformed. Using empty dict.")
             constants = {}
 
-        events = parse_events_array_aggressive(events_str)
+        events = parse_events_array_robust(events_str)
         
         netlog_data = {
             "constants": constants,
